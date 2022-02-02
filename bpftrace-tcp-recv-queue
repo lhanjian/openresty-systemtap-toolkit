@@ -1,0 +1,79 @@
+#!/usr/bin/env bpftrace
+
+#include <linux/socket.h>
+#include <net/sock.h>
+#include <net/tcp.h>
+
+//kprobe:tcp_data_queue
+kprobe:tcp_queue_rcv
+{
+    $sk = (struct sock *)arg0;
+    $sport = $sk->__sk_common.skc_num;
+    if ($sport == 80) {
+        $skb = (struct sk_buff *)arg1;
+        if ((uint64)$skb->len > 0) {
+            $cb = (struct tcp_skb_cb *)$skb->cb;
+            $seq = $cb->seq;
+            $end_seq = $cb->end_seq;
+            //printf("seq=%u,end_seq=%u,notequal=%u\n", $seq, $end_seq, $end_seq-$seq);
+            if ($seq != $end_seq ) {
+                $start = nsecs;
+                $dport = $sk->__sk_common.skc_dport;
+                $dport = ($dport >> 8) | (($dport << 8) & 0x00FF00);
+                //printf("start=%u,func=%s,sk=%x,comm=%s,sport=%d,dport=%d,skb_len=%u\n",
+                    //$start, func, (uint64)$sk, comm, $sport, $dport, $skb->len);
+                //printf("seq=%u,end_seq=%u,notequal=%u,start_times=%u\n", $seq, $end_seq, $end_seq-$seq, @start_times[$sk, $dport]);
+                @start_times[$sk, $dport] = $start;
+            }
+        }
+   }
+}
+
+kprobe:tcp_recvmsg
+{
+    $sk = (struct sock *)arg0;
+    $sport = $sk->__sk_common.skc_num;
+    if ($sport == 80) {
+        //printf("nsecs:%u,func:%s,sk=%x,comm=%s,sport=%d,dport=%d,qlen=%d\n",
+            //nsecs, func, (uint64)$sk,comm, $sport,$dport, $qlen);
+        //printf("q:%x,skb:%x,qlen:%d\n", $q, $skb, $qlen);
+        $qlen = $sk->sk_receive_queue.qlen;
+        if ($qlen > 0) {
+            $dport = $sk->__sk_common.skc_dport;
+            $dport = ($dport >> 8) | (($dport << 8) & 0x00FF00);
+            $begin = @start_times[$sk, $dport];
+            //printf("func:%s,begin:%u,minus:%u\n", func, $begin, nsecs - $begin);
+            if ($begin > 0) {
+                $end = nsecs;
+                //printf("end:%u,func:%s,sk=%x,comm=%s,sport=%d,dport=%d,qlen=%d\n",
+                    //$end, func, (uint64)$sk,comm, $sport,$dport, $qlen);
+                //@latency[$sk, $dport] = $end - $begin;
+                @latency = hist($end - $begin);
+                //printf("func:%s,begin:%u,latency:%u\n", func, $begin, $end - $begin);
+                delete(@start_times[$sk, $dport]);
+            }
+        }
+    }
+}
+
+kprobe:tcp_close,kprobe:tcp_disconnect
+{
+    $sk = (struct sock *)arg0;
+    $qlen =  $sk->sk_receive_queue.qlen;
+    $sport = $sk->__sk_common.skc_num;
+    $dport = $sk->__sk_common.skc_dport;
+    $dport = ($dport >> 8) | (($dport << 8) & 0x00FF00);
+    if ($qlen > 0) {
+        //printf("nsecs:%u,func:%s,sk=%x,comm=%s,sport=%d,dport=%d,qlen=%d\n",
+            //nsecs, func, (uint64)$sk,comm, $sport,$dport, $qlen);
+        if ($sport == 80) {
+            delete(@start_times[$sk, $dport]);
+        }
+    }
+}
+
+interval:s:5
+{
+    print(@latency);
+    clear(@latency);
+}
